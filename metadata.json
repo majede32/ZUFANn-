@@ -1,0 +1,6 @@
+{
+  "name": "ترجمان المانجا | Manga Arabic Translator",
+  "description": "تطبيق متطور لقراءة وترجمة فصول المانجا والمانهوا إلى اللغة العربية فورياً مع الحفاظ على الفقاعات والسياق القصصي ودعم تصفح المواقع.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
