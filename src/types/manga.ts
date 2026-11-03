@@ -58,4 +58,5 @@ export interface ReaderSettings {
   autoTranslatePages: boolean;
   zoom: number; // 60% to 140%
   fitMode: 'width' | 'contain' | 'original';
+  editMode?: boolean; // Interactive bubble adjuster mode
 }

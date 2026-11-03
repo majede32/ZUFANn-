@@ -6,6 +6,7 @@ interface NavbarProps {
   onOpenGlossary: () => void;
   onOpenUpload: () => void;
   onOpenUrlModal: () => void;
+  onOpenHistory?: () => void;
   currentChapterTitle: string;
 }
 
@@ -14,6 +15,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenGlossary,
   onOpenUpload,
   onOpenUrlModal,
+  onOpenHistory,
   currentChapterTitle,
 }) => {
   return (
@@ -21,7 +23,7 @@ export const Navbar: React.FC<NavbarProps> = ({
       <div className="max-w-7xl mx-auto flex items-center justify-between gap-8">
         {/* Zone 1: Brand Wordmark */}
         <div className="flex items-center gap-3 shrink-0">
-          <div className="w-9 h-9 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 shadow-sm">
+          <div className="w-9 h-9 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 shadow-sm">
             <BookOpen className="w-5 h-5" />
           </div>
           <div className="flex flex-col">
@@ -32,34 +34,43 @@ export const Navbar: React.FC<NavbarProps> = ({
         </div>
 
         {/* Zone 2: Navigation Links */}
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-neutral-400">
+        <nav className="hidden md:flex items-center gap-5 text-xs lg:text-sm font-medium text-neutral-400">
           <button
             onClick={onOpenUrlModal}
             className="hover:text-amber-400 transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
           >
             <Globe className="w-4 h-4" />
-            <span>تصفح موقع مانجا</span>
-          </button>
-          <button
-            onClick={onOpenGlossary}
-            className="hover:text-amber-400 transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
-          >
-            <Layers className="w-4 h-4" />
-            <span>قاموس الموريم والمانهوا</span>
+            <span>جلب من رابط</span>
           </button>
           <button
             onClick={onOpenUpload}
             className="hover:text-amber-400 transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
           >
             <Upload className="w-4 h-4" />
-            <span>ترجمة صورك الخاصة</span>
+            <span>رفع صور / حزمة ZIP</span>
+          </button>
+          {onOpenHistory && (
+            <button
+              onClick={onOpenHistory}
+              className="hover:text-amber-400 transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
+            >
+              <BookOpen className="w-4 h-4" />
+              <span>سجل القراءة والمفضلة</span>
+            </button>
+          )}
+          <button
+            onClick={onOpenGlossary}
+            className="hover:text-amber-400 transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
+          >
+            <Layers className="w-4 h-4" />
+            <span>قاموس الموريم</span>
           </button>
           <button
             onClick={onOpenSettings}
             className="hover:text-amber-400 transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer"
           >
             <Sliders className="w-4 h-4" />
-            <span>تخصيص الخط والفقاعات</span>
+            <span>التخصيص</span>
           </button>
         </nav>
 

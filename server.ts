@@ -6,6 +6,7 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import * as cheerio from 'cheerio';
+import fs from 'fs';
 import { isSafeUrl, createRateLimiter } from './src/server/security.ts';
 import { SAMPLE_CHAPTERS } from './src/data/sampleChapters.ts';
 
@@ -38,12 +39,60 @@ if (apiKey && apiKey !== 'MY_GEMINI_API_KEY') {
   });
 }
 
-// In-memory Translation Cache (SHA-256 hash -> translation data)
+// Translation Cache (In-Memory + Persistent Disk Cache that survives restarts)
 interface CachedTranslation {
   timestamp: number;
   data: any;
 }
 const translationCache = new Map<string, CachedTranslation>();
+const CACHE_DIR = path.join(__dirname, 'data', 'cache', 'translations');
+
+try {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+} catch (e) {
+  console.warn('Failed to initialize cache directory', e);
+}
+
+async function getCachedTranslation(hash: string): Promise<any | null> {
+  // 1. Check in-memory map
+  const mem = translationCache.get(hash);
+  if (mem && Date.now() - mem.timestamp < 7 * 24 * 60 * 60 * 1000) {
+    return mem.data;
+  }
+
+  // 2. Check persistent disk file
+  try {
+    const filePath = path.join(CACHE_DIR, `${hash}.json`);
+    if (fs.existsSync(filePath)) {
+      const content = await fs.promises.readFile(filePath, 'utf-8');
+      const parsed = JSON.parse(content);
+      if (parsed && parsed.data && Date.now() - parsed.timestamp < 7 * 24 * 60 * 60 * 1000) {
+        translationCache.set(hash, {
+          timestamp: parsed.timestamp,
+          data: parsed.data,
+        });
+        return parsed.data;
+      }
+    }
+  } catch (err) {
+    console.warn(`Error reading disk cache for hash ${hash}:`, err);
+  }
+  return null;
+}
+
+async function saveCachedTranslation(hash: string, data: any): Promise<void> {
+  const item: CachedTranslation = {
+    timestamp: Date.now(),
+    data,
+  };
+  translationCache.set(hash, item);
+  try {
+    const filePath = path.join(CACHE_DIR, `${hash}.json`);
+    await fs.promises.writeFile(filePath, JSON.stringify(item), 'utf-8');
+  } catch (err) {
+    console.warn(`Failed to write disk cache for hash ${hash}:`, err);
+  }
+}
 
 // Rate limiters
 const proxyRateLimiter = createRateLimiter({
@@ -229,6 +278,23 @@ app.post('/api/manga/fetch-chapter', scrapeRateLimiter, async (req, res) => {
       });
     }
 
+    let prevChapterUrl: string | undefined;
+    let nextChapterUrl: string | undefined;
+
+    // Detect next and previous chapter navigation links
+    $('a[href*="chapter"], a.next_page, a.prev_page, .nav-previous a, .nav-next a').each((_, el) => {
+      const href = $(el).attr('href');
+      const text = $(el).text().toLowerCase();
+      const rel = $(el).attr('rel') || '';
+      if (href && href.startsWith('http') && href !== url) {
+        if (text.includes('next') || text.includes('التالي') || rel.includes('next')) {
+          if (!nextChapterUrl) nextChapterUrl = href;
+        } else if (text.includes('prev') || text.includes('السابق') || rel.includes('prev')) {
+          if (!prevChapterUrl) prevChapterUrl = href;
+        }
+      }
+    });
+
     const scrapedChapter = {
       id: 'scraped-' + Date.now(),
       title,
@@ -237,6 +303,8 @@ app.post('/api/manga/fetch-chapter', scrapeRateLimiter, async (req, res) => {
       chapterTitle,
       chapterTitleArabic: chapterTitle,
       sourceUrl: url,
+      prevChapterUrl,
+      nextChapterUrl,
       coverImage: `/api/proxy-image?url=${encodeURIComponent(imageUrls[0])}`,
       pages: imageUrls.map((img, idx) => ({
         pageNumber: idx + 1,
@@ -274,7 +342,49 @@ app.get('/api/manga/samples', (req, res) => {
   });
 });
 
-// 4. Translate Manga Page using Gemini Vision with honest errors, SHA-256 caching, and structured schema
+// 3.5. Translate custom or selected text (called by translateCustomText)
+app.post('/api/manga/translate-text', translateRateLimiter, async (req, res) => {
+  const { text, context } = req.body;
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ success: false, error: 'النص المطلوب ترجمته فارغ' });
+  }
+
+  if (!ai) {
+    return res.status(401).json({
+      success: false,
+      error: 'مفتاح Gemini API غير متوفر في متغيرات البيئة.',
+    });
+  }
+
+  try {
+    const prompt = `You are a professional manga/manhwa typesetter and translator.
+Translate this dialogue accurately into natural, evocative Modern Standard Arabic suited for manga/comics.
+Original dialogue: "${text}"
+${context ? `Context: ${context}` : ''}
+Provide only the Arabic translation directly, with no surrounding explanations or quotes.`;
+
+    const geminiCall = ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: prompt,
+    });
+
+    const response = await withTimeout(geminiCall, 15000, 'انتهت مهلة ترجمة النص');
+    const arabicTranslation = response.text ? response.text.trim() : text;
+
+    return res.json({
+      success: true,
+      arabicTranslation,
+    });
+  } catch (err: any) {
+    console.error('Text translation error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'فشلت ترجمة النص',
+    });
+  }
+});
+
+// 4. Translate Manga Page using Gemini Vision with honest errors, persistent SHA-256 caching, and structured schema
 app.post('/api/manga/translate-page', translateRateLimiter, async (req, res) => {
   const { imageSource, pageNumber } = req.body;
   const pageNum = parseInt(pageNumber, 10) || 1;
@@ -375,15 +485,14 @@ app.post('/api/manga/translate-page', translateRateLimiter, async (req, res) => 
       });
     }
 
-    // Compute SHA-256 hash for translation cache lookup
+    // Compute SHA-256 hash for persistent cache lookup
     const imageHash = crypto.createHash('sha256').update(base64Data).digest('hex');
-    const cached = translationCache.get(imageHash);
+    const cachedData = await getCachedTranslation(imageHash);
 
-    // Cache valid for 48 hours
-    if (cached && Date.now() - cached.timestamp < 48 * 60 * 60 * 1000) {
+    if (cachedData) {
       return res.json({
         success: true,
-        translation: cached.data,
+        translation: cachedData,
         cached: true,
       });
     }
@@ -397,6 +506,7 @@ Task:
    - xmin: left percentage * 10
    - ymax: bottom percentage * 10
    - xmax: right percentage * 10
+   The box MUST fully enclose all of the original text of that bubble or caption (with a small margin) so it can be completely covered by the Arabic text. Do not omit any text, including captions, narration boxes and sound effects.
 3. Extract the original text in the speech bubble.
 4. Translate it accurately and naturally into Modern Standard Arabic suited for manga/manhwa. Preserve emotional tone and character personality.
 5. Provide a short pageSummary in Arabic, and explain any martial arts, fantasy, or historical terminology in termsExplained.`;
@@ -506,11 +616,8 @@ Task:
       };
     });
 
-    // Save into cache
-    translationCache.set(imageHash, {
-      timestamp: Date.now(),
-      data: parsed,
-    });
+    // Save into persistent disk & memory cache
+    await saveCachedTranslation(imageHash, parsed);
 
     return res.json({
       success: true,

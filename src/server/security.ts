@@ -1,4 +1,5 @@
 import dns from 'dns/promises';
+import net from 'net';
 import { Request, Response, NextFunction } from 'express';
 
 // Check if an IPv4 or IPv6 string is within private/internal/reserved ranges
@@ -10,8 +11,12 @@ export function isPrivateIp(ip: string): boolean {
 
   // IPv6 checks
   if (ip === '::1' || ip === '::') return true;
-  if (ip.toLowerCase().startsWith('fc') || ip.toLowerCase().startsWith('fd')) return true; // unique local fc00::/7
-  if (ip.toLowerCase().startsWith('fe80')) return true; // link local fe80::/10
+  if (net.isIPv6(ip)) {
+    const l = ip.toLowerCase();
+    if (/^f[cd]/.test(l)) return true; // unique local fc00::/7
+    if (/^fe[89ab]/.test(l)) return true; // link local fe80::/10
+    return false;
+  }
 
   // IPv4 checks
   const parts = ip.split('.').map((p) => parseInt(p, 10));
@@ -82,11 +87,14 @@ export async function isSafeUrl(urlString: string): Promise<{ safe: boolean; rea
       return { safe: false, reason: 'الوصول إلى هذا النطاق محظور لأسباب أمنية' };
     }
 
-    // 3. Reject direct raw private IP addresses
-    if (isPrivateIp(hostname)) {
+    // 3. Reject direct raw private IP addresses (only when the host really is an IP literal)
+    const bareHost = hostname.replace(/^\[|\]$/g, '');
+    if (net.isIP(bareHost) && isPrivateIp(bareHost)) {
       return { safe: false, reason: 'الوصول إلى عناوين الشبكة المحلية أو الخاصة محظور (SSRF Protection)' };
     }
 
+    // Numeric-only hosts such as http://2130706433/ are normalized by URL(); any other
+    // non-IP host is resolved below.
     // 4. Resolve DNS to ensure the domain does not resolve to an internal/private IP
     try {
       const records = await dns.lookup(hostname, { all: true });

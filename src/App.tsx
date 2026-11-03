@@ -1,15 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   ChevronRight,
   ChevronLeft,
   Sparkles,
   BookOpen,
   ArrowUp,
-  Sliders,
   Globe,
   Upload,
   Layers,
-  HelpCircle
+  SlidersHorizontal
 } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { ChapterBar } from './components/ChapterBar';
@@ -18,8 +17,14 @@ import { UrlBarModal } from './components/UrlBarModal';
 import { GlossaryDrawer } from './components/GlossaryDrawer';
 import { ReaderSettingsModal } from './components/ReaderSettingsModal';
 import { UploadModal } from './components/UploadModal';
-import { MangaChapter, MangaPage, ReaderSettings } from './types/manga';
+import { HistoryDrawer } from './components/HistoryDrawer';
+import { MangaChapter, MangaDialogue, MangaPage, ReaderSettings } from './types/manga';
 import { fetchChapterFromUrl, fetchSampleChapters, translatePage } from './utils/mangaApi';
+import {
+  saveReadingProgress,
+  getCachedPageTranslation,
+  setCachedPageTranslation
+} from './utils/storage';
 import { SAMPLE_CHAPTERS } from './data/sampleChapters';
 
 const INITIAL_CHAPTER: MangaChapter = SAMPLE_CHAPTERS[0];
@@ -38,10 +43,11 @@ export default function App() {
     bubbleFontSize: 'md',
     bubbleOpacity: 1.0,
     maskCoverage: 'extended',
-    showOriginalOnHover: true,
-    autoTranslatePages: false,
+    showOriginalOnHover: false,
+    autoTranslatePages: true,
     zoom: 1.0,
     fitMode: 'width',
+    editMode: false,
   });
 
   // Modals & Drawers
@@ -49,10 +55,14 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isGlossaryOpen, setIsGlossaryOpen] = useState(false);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
-  // Loading States
+  // Loading & Queue States
   const [isLoadingChapter, setIsLoadingChapter] = useState(false);
   const [isTranslatingAll, setIsTranslatingAll] = useState(false);
+  const [translatingProgress, setTranslatingProgress] = useState<{ current: number; total: number } | undefined>();
+  const isTranslatingAllCancelledRef = useRef(false);
+
   const [urlError, setUrlError] = useState<string | undefined>();
   const [showScrollTop, setShowScrollTop] = useState(false);
 
@@ -66,6 +76,13 @@ export default function App() {
       })
       .catch((err) => console.warn('Could not load extra samples', err));
   }, []);
+
+  // Save reading progress to local storage
+  useEffect(() => {
+    if (currentChapter) {
+      saveReadingProgress(currentChapter, singlePageIndex + 1);
+    }
+  }, [currentChapter, singlePageIndex]);
 
   // Track scroll for "Scroll to top" button
   useEffect(() => {
@@ -81,12 +98,30 @@ export default function App() {
     setSettings((prev) => ({ ...prev, ...newSettings }));
   };
 
-  // Translate a specific page using Gemini
-  const handleTranslatePage = async (pageNumber: number) => {
+  // Translate a specific page using Gemini with client cache check
+  const handleTranslatePage = async (pageNumber: number): Promise<boolean> => {
     const pageIndex = currentChapter.pages.findIndex((p) => p.pageNumber === pageNumber);
-    if (pageIndex === -1) return;
+    if (pageIndex === -1) return false;
 
     const page = currentChapter.pages[pageIndex];
+
+    // Check client storage cache first
+    const clientCacheKey = `${currentChapter.id}_p${pageNumber}`;
+    const cachedClient = getCachedPageTranslation(clientCacheKey);
+    if (cachedClient && cachedClient.dialogues && cachedClient.dialogues.length > 0) {
+      setCurrentChapter((prev) => {
+        const updatedPages = [...prev.pages];
+        updatedPages[pageIndex] = {
+          ...updatedPages[pageIndex],
+          isTranslating: false,
+          translatedData: cachedClient,
+          termsExplained: cachedClient.termsExplained,
+          error: undefined,
+        };
+        return { ...prev, pages: updatedPages };
+      });
+      return true;
+    }
 
     // Mark as translating
     setCurrentChapter((prev) => {
@@ -102,6 +137,9 @@ export default function App() {
         currentChapter.titleArabic || currentChapter.title
       );
 
+      // Save to client cache
+      setCachedPageTranslation(clientCacheKey, translation);
+
       setCurrentChapter((prev) => {
         const updatedPages = [...prev.pages];
         updatedPages[pageIndex] = {
@@ -109,9 +147,11 @@ export default function App() {
           isTranslating: false,
           translatedData: translation,
           termsExplained: translation.termsExplained,
+          error: undefined,
         };
         return { ...prev, pages: updatedPages };
       });
+      return true;
     } catch (err: any) {
       setCurrentChapter((prev) => {
         const updatedPages = [...prev.pages];
@@ -122,25 +162,96 @@ export default function App() {
         };
         return { ...prev, pages: updatedPages };
       });
+      return false;
     }
   };
 
-  // Translate All Pages Sequentially
+  // Translate All Pages with Concurrency Queue & Progress
   const handleTranslateAllPages = async () => {
     if (isTranslatingAll) return;
     setIsTranslatingAll(true);
+    isTranslatingAllCancelledRef.current = false;
 
-    for (const page of currentChapter.pages) {
-      const hasTranslation =
-        (page.translatedData?.dialogues && page.translatedData.dialogues.length > 0) ||
-        (page.precomputedTranslations && page.precomputedTranslations.length > 0);
+    const untranslated = currentChapter.pages.filter(
+      (p) =>
+        (!p.translatedData?.dialogues || p.translatedData.dialogues.length === 0) &&
+        (!p.precomputedTranslations || p.precomputedTranslations.length === 0)
+    );
 
-      if (!hasTranslation) {
-        await handleTranslatePage(page.pageNumber);
+    const totalToTranslate = untranslated.length;
+    let completed = 0;
+
+    for (const page of untranslated) {
+      if (isTranslatingAllCancelledRef.current) break;
+      completed++;
+      setTranslatingProgress({ current: completed, total: totalToTranslate });
+
+      await handleTranslatePage(page.pageNumber);
+
+      // Polite cooldown between requests to preserve API quota
+      if (!isTranslatingAllCancelledRef.current) {
+        await new Promise((r) => setTimeout(r, 600));
       }
     }
 
     setIsTranslatingAll(false);
+    setTranslatingProgress(undefined);
+  };
+
+  const handleCancelTranslateAll = () => {
+    isTranslatingAllCancelledRef.current = true;
+    setIsTranslatingAll(false);
+    setTranslatingProgress(undefined);
+  };
+
+  // Auto-translate every page with cooldown
+  const autoAttemptedRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!settings.autoTranslatePages) return;
+    let cancelled = false;
+    const run = async () => {
+      for (const page of currentChapter.pages) {
+        if (cancelled) return;
+        const key = `${currentChapter.id}:${page.pageNumber}`;
+        const hasTranslation =
+          (page.translatedData?.dialogues && page.translatedData.dialogues.length > 0) ||
+          (page.precomputedTranslations && page.precomputedTranslations.length > 0);
+        if (hasTranslation || page.isTranslating || autoAttemptedRef.current.has(key)) continue;
+        autoAttemptedRef.current.add(key);
+        await handleTranslatePage(page.pageNumber);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChapter.id, settings.autoTranslatePages]);
+
+  // Update page dialogues from Interactive Adjuster or Manual Adding
+  const handleUpdatePageDialogues = (pageNumber: number, dialogues: MangaDialogue[]) => {
+    setCurrentChapter((prev) => {
+      const updatedPages = prev.pages.map((p) => {
+        if (p.pageNumber === pageNumber) {
+          const translatedData = p.translatedData || {
+            pageSummary: '',
+            dialogues: [],
+          };
+          const nextData = { ...translatedData, dialogues };
+          // Sync client cache
+          const clientCacheKey = `${prev.id}_p${pageNumber}`;
+          setCachedPageTranslation(clientCacheKey, nextData);
+
+          return {
+            ...p,
+            translatedData: nextData,
+          };
+        }
+        return p;
+      });
+      return { ...prev, pages: updatedPages };
+    });
   };
 
   // Fetch chapter from user URL
@@ -186,7 +297,7 @@ export default function App() {
     setSinglePageIndex(0);
   };
 
-  // Compute stats
+  // Stats
   const totalTranslatedCount = currentChapter.pages.filter(
     (p) =>
       (p.translatedData?.dialogues && p.translatedData.dialogues.length > 0) ||
@@ -201,6 +312,7 @@ export default function App() {
         onOpenGlossary={() => setIsGlossaryOpen(true)}
         onOpenUpload={() => setIsUploadOpen(true)}
         onOpenUrlModal={() => setIsUrlModalOpen(true)}
+        onOpenHistory={() => setIsHistoryOpen(true)}
         currentChapterTitle={currentChapter.titleArabic}
       />
 
@@ -212,10 +324,13 @@ export default function App() {
           setCurrentChapter(ch);
           setSinglePageIndex(0);
         }}
+        onFetchUrl={handleFetchUrl}
         settings={settings}
         onUpdateSettings={handleUpdateSettings}
         onTranslateAllPages={handleTranslateAllPages}
+        onCancelTranslateAll={handleCancelTranslateAll}
         isTranslatingAll={isTranslatingAll}
+        translatingProgress={translatingProgress}
         totalTranslated={totalTranslatedCount}
         totalPages={currentChapter.pages.length}
       />
@@ -232,6 +347,10 @@ export default function App() {
                 chapterTitle={currentChapter.titleArabic || currentChapter.title}
                 settings={settings}
                 onTranslatePage={handleTranslatePage}
+                onUpdatePageDialogues={handleUpdatePageDialogues}
+                onToggleEditMode={() =>
+                  handleUpdateSettings({ editMode: !settings.editMode })
+                }
               />
             ))}
           </div>
@@ -244,11 +363,15 @@ export default function App() {
                 chapterTitle={currentChapter.titleArabic || currentChapter.title}
                 settings={settings}
                 onTranslatePage={handleTranslatePage}
+                onUpdatePageDialogues={handleUpdatePageDialogues}
+                onToggleEditMode={() =>
+                  handleUpdateSettings({ editMode: !settings.editMode })
+                }
               />
             )}
 
             {/* Single Page Pagination Footer */}
-            <div className="flex items-center justify-center gap-4 mt-6 p-2 bg-neutral-900 border border-neutral-800 rounded-2xl">
+            <div className="flex items-center justify-center gap-4 mt-6 p-2.5 bg-neutral-900 border border-neutral-800 rounded-2xl shadow-lg">
               <button
                 onClick={() => setSinglePageIndex(Math.max(0, singlePageIndex - 1))}
                 disabled={singlePageIndex === 0}
@@ -258,7 +381,7 @@ export default function App() {
                 <span>الصفحة السابقة</span>
               </button>
 
-              <span className="text-xs font-mono text-neutral-300">
+              <span className="text-xs font-mono font-bold text-neutral-300 px-2">
                 {singlePageIndex + 1} / {currentChapter.pages.length}
               </span>
 
@@ -279,7 +402,7 @@ export default function App() {
         )}
 
         {/* Chapter End Navigation Card */}
-        <div className="max-w-xl mx-auto mt-12 mb-8 p-6 bg-neutral-900/90 border border-neutral-800 rounded-2xl text-center flex flex-col items-center gap-3 shadow-xl">
+        <div className="max-w-xl mx-auto mt-12 mb-8 p-6 bg-neutral-900/90 border border-neutral-800 rounded-3xl text-center flex flex-col items-center gap-3 shadow-xl">
           <BookOpen className="w-8 h-8 text-amber-400" />
           <h3 className="text-base font-bold text-white">
             وصلت إلى نهاية {currentChapter.chapterTitleArabic || currentChapter.chapterTitle}
@@ -290,7 +413,7 @@ export default function App() {
           <div className="flex items-center gap-3 mt-2">
             <button
               onClick={() => setIsUrlModalOpen(true)}
-              className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold text-xs rounded-xl transition-all cursor-pointer flex items-center gap-1.5"
+              className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold text-xs rounded-xl transition-all cursor-pointer flex items-center gap-1.5 shadow-md shadow-amber-500/20"
             >
               <Globe className="w-4 h-4" />
               <span>جلب فصل جديد من رابط</span>
@@ -340,6 +463,12 @@ export default function App() {
         isOpen={isUploadOpen}
         onClose={() => setIsUploadOpen(false)}
         onCustomPagesAdded={handleCustomPagesAdded}
+      />
+
+      <HistoryDrawer
+        isOpen={isHistoryOpen}
+        onClose={() => setIsHistoryOpen(false)}
+        onSelectChapterUrl={handleFetchUrl}
       />
     </div>
   );
