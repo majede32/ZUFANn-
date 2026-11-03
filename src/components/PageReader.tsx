@@ -98,9 +98,9 @@ export const PageReader: React.FC<PageReaderProps> = ({
                 <span>مترجمة ({activeTranslations.length} حوار)</span>
               </div>
             ) : page.isTranslating ? (
-              <div className="flex items-center gap-1.5 text-amber-400 text-xs">
+              <div className="flex items-center gap-1.5 text-amber-400 text-xs font-medium">
                 <RefreshCw className="w-4 h-4 animate-spin" />
-                <span>جاري استخراج الحوارات...</span>
+                <span>جاري استخراج وترجمة الحوارات بالذكاء الاصطناعي...</span>
               </div>
             ) : (
               <button
@@ -167,9 +167,18 @@ export const PageReader: React.FC<PageReaderProps> = ({
 
         {/* Translation Error alert if any */}
         {page.error && (
-          <div className="w-full p-2.5 bg-red-950/60 border-t border-red-800/80 text-xs text-red-200 flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-            <span>{page.error}</span>
+          <div className="w-full p-3 bg-red-950/80 border-t border-red-800 text-xs text-red-200 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              <span>{page.error}</span>
+            </div>
+            <button
+              onClick={() => onTranslatePage(page.pageNumber)}
+              className="px-3 py-1 bg-red-800 hover:bg-red-700 text-white rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 shrink-0"
+            >
+              <RefreshCw className="w-3 h-3" />
+              <span>إعادة المحاولة</span>
+            </button>
           </div>
         )}
 

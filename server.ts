@@ -2,10 +2,12 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import * as cheerio from 'cheerio';
-import fs from 'fs';
+import { isSafeUrl, createRateLimiter } from './src/server/security.ts';
+import { SAMPLE_CHAPTERS } from './src/data/sampleChapters.ts';
 
 dotenv.config();
 
@@ -15,8 +17,12 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+// Enforce safe 15MB payload size limit
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+
+// Trust proxy headers for accurate client IP in rate limiting
+app.set('trust proxy', 1);
 
 // Initialize Google GenAI
 const apiKey = process.env.GEMINI_API_KEY;
@@ -32,513 +38,125 @@ if (apiKey && apiKey !== 'MY_GEMINI_API_KEY') {
   });
 }
 
-// Complete authentic translations for all 18 pages of Chapter 24
-const CHAPTER_24_FULL_PAGES: Record<number, any[]> = {
-  1: [
-    {
-      id: 'c24-p1-1',
-      box_2d: [120, 150, 240, 850],
-      originalText: "Becoming the Cheon Clan's Mad Dog - Chapter 24",
-      arabicTranslation: "كلب عشيرة تشيون المسعور - الفصل 24",
-      speaker: "عنوان السلسلة",
-      type: "narration",
-      tone: "determined",
-    },
-    {
-      id: 'c24-p1-2',
-      box_2d: [680, 200, 820, 800],
-      originalText: "A strange sensation washed over me... like floating alone in a vast ocean.",
-      arabicTranslation: "اجتاحني شعور غريب ومباغت... وكأنني أطفو وحيداً في بحر لجي لا قرار له.",
-      speaker: "تشيون مويانغ",
-      type: "thought",
-      tone: "calm",
-    },
-  ],
-  2: [
-    {
-      id: 'c24-p2-1',
-      box_2d: [260, 300, 320, 700],
-      originalText: "Let me show you a sword.",
-      arabicTranslation: "دعني أريك حقيقة فن السيف!",
-      speaker: "تشيون مويانغ",
-      type: "speech",
-      tone: "determined",
-    },
-    {
-      id: 'c24-p2-2',
-      box_2d: [680, 250, 740, 750],
-      originalText: "The internal Qi within my Danjeon is burning violently!",
-      arabicTranslation: "طاقة التشي داخل الدانجون تلتهب بعنف كالحمم البركانية!",
-      speaker: "تشيون مويانغ",
-      type: "thought",
-      tone: "angry",
-    },
-  ],
-  3: [
-    {
-      id: 'c24-p3-1',
-      box_2d: [350, 180, 480, 820],
-      originalText: "A single streak of celestial light cuts through the realm of creation!",
-      arabicTranslation: "بصيص من نور سماوي يشق مبادئ الخلق والكون!",
-      speaker: "تشيون مويانغ",
-      type: "thought",
-      tone: "determined",
-    },
-    {
-      id: 'c24-p3-2',
-      box_2d: [620, 220, 750, 780],
-      originalText: "This sword path... it points towards the Upper Heavens!",
-      arabicTranslation: "هذا المسار في فن السيف... إنه يوجّهني نحو السماوات العليا!",
-      speaker: "تشيون مويانغ",
-      type: "shout",
-      tone: "determined",
-    },
-  ],
-  4: [
-    {
-      id: 'c24-p4-1',
-      box_2d: [180, 200, 310, 800],
-      originalText: "*Cough!* Blood... my meridians barely withstood the surge.",
-      arabicTranslation: "*يسعل دماً!* لقد كادت مسارات الطاقة في جسدي أن تنفجر من قوة التدفق.",
-      speaker: "تشيون مويانغ",
-      type: "speech",
-      tone: "shocked",
-    },
-    {
-      id: 'c24-p4-2',
-      box_2d: [650, 220, 780, 780],
-      originalText: "Young Master! You have finally awakened!",
-      arabicTranslation: "سيدي الشاب! حمداً لله، لقد استعدت وعيك أخيراً!",
-      speaker: "التابع الحارس",
-      type: "shout",
-      tone: "shocked",
-    },
-  ],
-  5: [
-    {
-      id: 'c24-p5-1',
-      box_2d: [200, 220, 330, 780],
-      originalText: "How is Wolyeong? Did she sustain any injuries during the chaos?!",
-      arabicTranslation: "كيف حال ووليونغ؟! هل أصابها أي مكروه أثناء تلك الفوضى العارمة؟!",
-      speaker: "تشيون مويانغ",
-      type: "speech",
-      tone: "determined",
-    },
-    {
-      id: 'c24-p5-2',
-      box_2d: [620, 240, 750, 760],
-      originalText: "Lady Wolyeong is safe, but the Clan Elders are already gathering.",
-      arabicTranslation: "الآنسة ووليونغ بأمان، لكن شيوخ العشيرة بدأوا يحتشدون في القاعة الكبرى.",
-      speaker: "التابع الحارس",
-      type: "speech",
-      tone: "calm",
-    },
-  ],
-  6: [
-    {
-      id: 'c24-p6-1',
-      box_2d: [250, 200, 380, 800],
-      originalText: "Those vultures... they think the 'Mad Dog' has lost his fangs.",
-      arabicTranslation: "أولئك النسور الجشعة... يظنون أن 'الكلب المسعور' قد كُسرت أنيابه.",
-      speaker: "تشيون مويانغ",
-      type: "thought",
-      tone: "angry",
-    },
-    {
-      id: 'c24-p6-2',
-      box_2d: [680, 220, 810, 780],
-      originalText: "Let them come. I will show them the true terror of the Cheon bloodline.",
-      arabicTranslation: "دعهم يأتوا إذاً! سأريهم الرعب الحقيقي الذي تحمله سلالة تشيون.",
-      speaker: "تشيون مويانغ",
-      type: "speech",
-      tone: "determined",
-    },
-  ],
-  7: [
-    {
-      id: 'c24-p7-1',
-      box_2d: [280, 200, 410, 800],
-      originalText: "Is it true that the young lord shattered the testing stone with a single blow?!",
-      arabicTranslation: "أصحيح ما يُشاع بأن السيد الشاب قد حطم صخرة الاختبار بضربة واحدة لا غير؟!",
-      speaker: "تلاميذ العشيرة",
-      type: "speech",
-      tone: "shocked",
-    },
-    {
-      id: 'c24-p7-2',
-      box_2d: [650, 220, 780, 780],
-      originalText: "Impossible! That stone was forged from cold meteoric steel!",
-      arabicTranslation: "مستحيل! كانت تلك الصخرة مصنوعة من فولاذ النيزك البارد المستحيل كسره!",
-      speaker: "تلميذ متدرب",
-      type: "speech",
-      tone: "shocked",
-    },
-  ],
-  8: [
-    {
-      id: 'c24-p8-1',
-      box_2d: [250, 200, 390, 800],
-      originalText: "He is completely different from the unruly rascal we once knew...",
-      arabicTranslation: "إنه يختلف كلياً عن الفتى الطائش والمتهور الذي عهدناه في السابق...",
-      speaker: "كبير الشيوخ",
-      type: "thought",
-      tone: "calm",
-    },
-    {
-      id: 'c24-p8-2',
-      box_2d: [680, 220, 810, 780],
-      originalText: "His gaze holds the predatory presence of a demonic beast.",
-      arabicTranslation: "نظرة عينيه تحمل هيبة وافتراس وحش شيطاني قادم من الأعماق.",
-      speaker: "الشيخ الثاني",
-      type: "thought",
-      tone: "shocked",
-    },
-  ],
-  9: [
-    {
-      id: 'c24-p9-1',
-      box_2d: [300, 220, 440, 780],
-      originalText: "Stand down. From this day forward, I answer only to the Clan Head.",
-      arabicTranslation: "تراجعوا فوراً! اعتباراً من اليوم، لن أرد إلا على زعيم العشيرة بشخصه.",
-      speaker: "تشيون مويانغ",
-      type: "shout",
-      tone: "angry",
-    },
-    {
-      id: 'c24-p9-2',
-      box_2d: [680, 200, 810, 800],
-      originalText: "None of you have the authority to interrogate me!",
-      arabicTranslation: "لا يملك أي منكم السلطة أو الجرأة لمساءلتي بعد الآن!",
-      speaker: "تشيون مويانغ",
-      type: "shout",
-      tone: "determined",
-    },
-  ],
-  10: [
-    {
-      id: 'c24-p10-1',
-      box_2d: [280, 220, 420, 780],
-      originalText: "How dare you speak with such insolence in the sacred ancestral pavilion?!",
-      arabicTranslation: "كيف تجرؤ على التحدث بهذه الغطرسة في ساحة الأسلاف المقدسة؟!",
-      speaker: "الشيخ الثالث",
-      type: "shout",
-      tone: "angry",
-    },
-    {
-      id: 'c24-p10-2',
-      box_2d: [650, 200, 790, 800],
-      originalText: "Do you know the consequences of defying the Council of Elders?!",
-      arabicTranslation: "ألا تدرك عواقب التمرد على مجلس الشيوخ وقوانين العائلة الصارمة؟!",
-      speaker: "الشيخ الرابع",
-      type: "speech",
-      tone: "angry",
-    },
-  ],
-  11: [
-    {
-      id: 'c24-p11-1',
-      box_2d: [260, 200, 400, 800],
-      originalText: "Consequences?! You were the ones scheming behind my father's back!",
-      arabicTranslation: "العواقب؟! أنتم من بدأ هذا الفساد حين تآمرتم خلف ظهر والدي!",
-      speaker: "تشيون مويانغ",
-      type: "shout",
-      tone: "angry",
-    },
-    {
-      id: 'c24-p11-2',
-      box_2d: [680, 220, 820, 780],
-      originalText: "If you wish to subdue me, draw your weapons together right now!",
-      arabicTranslation: "إذا كنتم تريدون إخضاعي بالقوة، فلتجردوا سيوفكم جميعاً في هذه اللحظة!",
-      speaker: "تشيون مويانغ",
-      type: "shout",
-      tone: "determined",
-    },
-  ],
-  12: [
-    {
-      id: 'c24-p12-1',
-      box_2d: [300, 200, 440, 800],
-      originalText: "*BOOM!* Massive collision of internal energies!",
-      arabicTranslation: "*دووووي ارتطام قاصف واصطدام هائل في طاقة التشي!*",
-      speaker: "مؤثر صوتي (SFX)",
-      type: "sfx",
-      tone: "angry",
-    },
-    {
-      id: 'c24-p12-2',
-      box_2d: [680, 220, 820, 780],
-      originalText: "How can someone his age manifest such pure Sword Qi?!",
-      arabicTranslation: "كيف يمكن لمقاتل في مثل سنه أن يطلق نصل سيف بهذا النقاء والكثافة المرعبة؟!",
-      speaker: "الشيخ الثاني",
-      type: "thought",
-      tone: "shocked",
-    },
-  ],
-  13: [
-    {
-      id: 'c24-p13-1',
-      box_2d: [280, 200, 420, 800],
-      originalText: "Is this the Demon Wolf Sword Style left by the founding patriarch?!",
-      arabicTranslation: "هل هذا أسلوب 'سيف الذئب الشيطاني' الذي أبدعه المؤسس الأول للعشيرة؟!",
-      speaker: "كبير الشيوخ",
-      type: "speech",
-      tone: "shocked",
-    },
-    {
-      id: 'c24-p13-2',
-      box_2d: [680, 220, 810, 780],
-      originalText: "He absorbed the true essence of the technique during his coma!",
-      arabicTranslation: "لقد استوعب جوهر الأسلوب بالكامل ودمجه في عروقه أثناء غيبوبته الطويلة!",
-      speaker: "الشيخ الثالث",
-      type: "thought",
-      tone: "calm",
-    },
-  ],
-  14: [
-    {
-      id: 'c24-p14-1',
-      box_2d: [250, 220, 390, 780],
-      originalText: "Young Master Muyang, please stop! Straining further will tear your meridians!",
-      arabicTranslation: "سيدي الشاب مويانغ، أرجوك توقف! الضغط الإضافي سيمزق مسارات الطاقة لديك!",
-      speaker: "ووليونغ",
-      type: "speech",
-      tone: "whisper",
-    },
-    {
-      id: 'c24-p14-2',
-      box_2d: [680, 200, 820, 800],
-      originalText: "Wolyeong... step aside. This debt has been due for far too long.",
-      arabicTranslation: "ووليونغ... تنحي جانباً؛ هذا الحساب مؤجل ومستحق منذ زمن بعيد.",
-      speaker: "تشيون مويانغ",
-      type: "speech",
-      tone: "determined",
-    },
-  ],
-  15: [
-    {
-      id: 'c24-p15-1',
-      box_2d: [300, 200, 440, 800],
-      originalText: "The time for talk has ended. Whoever blocks my way is an enemy of the clan!",
-      arabicTranslation: "لقد انتهى وقت الكلام التافه. كل من يقف في وجهي سأعامله كعدو وخائن للعشيرة!",
-      speaker: "تشيون مويانغ",
-      type: "shout",
-      tone: "angry",
-    },
-    {
-      id: 'c24-p15-2',
-      box_2d: [700, 250, 840, 750],
-      originalText: "*Blue energy emanates from the dark blade*",
-      arabicTranslation: "*وهج أزرق ناري يشع من حد السيف الأسود متأهباً للقتال*",
-      speaker: "سرد بصري",
-      type: "narration",
-      tone: "determined",
-    },
-  ],
-  16: [
-    {
-      id: 'c24-p16-1',
-      box_2d: [240, 200, 380, 800],
-      originalText: "ENOUGH! Cease this futile conflict at once!",
-      arabicTranslation: "كفى! آمركم جميعاً بوقف هذا النزاع العقيم فوراً!",
-      speaker: "صوت جهوري (زعيم العشيرة)",
-      type: "shout",
-      tone: "angry",
-    },
-    {
-      id: 'c24-p16-2',
-      box_2d: [680, 220, 810, 780],
-      originalText: "The Patriarch (Gaju) has personally arrived at the courtyard!",
-      arabicTranslation: "حضرة زعيم العشيرة (الغاجو) قد وصل بنفسه إلى ساحة المواجهة!",
-      speaker: "الحراس والتلاميذ",
-      type: "speech",
-      tone: "shocked",
-    },
-  ],
-  17: [
-    {
-      id: 'c24-p17-1',
-      box_2d: [260, 200, 400, 800],
-      originalText: "Muyang... your strength has spoken for you. But sheath your blade.",
-      arabicTranslation: "مويانغ... قوتك أثبتت حقك في التحدث اليوم. لكن أعد نصلك إلى غمده.",
-      speaker: "زعيم العشيرة (الغاجو)",
-      type: "speech",
-      tone: "calm",
-    },
-    {
-      id: 'c24-p17-2',
-      box_2d: [680, 200, 820, 800],
-      originalText: "Understood, Father. But honor is not preserved through silence.",
-      arabicTranslation: "أفهم قصدك يا أبي، لكن الشرف لا يُصان بالصمت أمام المتآمرين.",
-      speaker: "تشيون مويانغ",
-      type: "speech",
-      tone: "determined",
-    },
-  ],
-  18: [
-    {
-      id: 'c24-p18-1',
-      box_2d: [300, 180, 450, 820],
-      originalText: "Next Chapter: The Blood Council and the Succession Decree",
-      arabicTranslation: "الفصل القادم: اجتماع مجلس الدم وقرار الوريث الشرعي لعشيرة تشيون.",
-      speaker: "خاتمة الفصل",
-      type: "narration",
-      tone: "determined",
-    },
-    {
-      id: 'c24-p18-2',
-      box_2d: [700, 220, 840, 780],
-      originalText: "To be continued in Chapter 25 - Becoming the Cheon Clan's Mad Dog",
-      arabicTranslation: "مستمر في الفصل 25 - كلب عشيرة تشيون المسعور.",
-      speaker: "ملاحظة المترجم",
-      type: "narration",
-      tone: "calm",
-    },
-  ],
-};
-
-function generateCheonClanChapter(chapterNum: number) {
-  const chStr = chapterNum.toString();
-  const pageCount = 18;
-  const baseUrl = `https://roliascan.org/storage/chapters/manhwa_93007_${chStr}`;
-
-  const pages = Array.from({ length: pageCount }, (_, i) => {
-    const pageNum = i + 1;
-    const pageIndexStr = pageNum < 10 ? `000${pageNum}` : `00${pageNum}`;
-    const realImageUrl = `${baseUrl}/${pageIndexStr}.webp`;
-    const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(realImageUrl)}`;
-
-    const dialogues = CHAPTER_24_FULL_PAGES[pageNum] || [
-      {
-        id: `c${chapterNum}-p${pageNum}-1`,
-        box_2d: [300, 200, 440, 800],
-        originalText: "Cheon Clan's Mad Dog - Dialogue scene",
-        arabicTranslation: `حوارات ومواجهة الصفحة ${pageNum} من الفصل ${chapterNum}.`,
-        speaker: "تشيون مويانغ",
-        type: "speech",
-        tone: "determined",
-      },
-    ];
-
-    return {
-      pageNumber: pageNum,
-      imageUrl: proxyUrl,
-      originalUrl: realImageUrl,
-      caption: `الفصل ${chapterNum} - الصفحة ${pageNum} من ${pageCount}`,
-      precomputedTranslations: dialogues,
-      termsExplained: [
-        {
-          term: "تشيون مويانغ (Cheon Muyang)",
-          explanation: "بطل القصة الملقب بـ 'كلب عشيرة تشيون المسعور'، استعاد وعيه وتجاوز حدود التدريب العادي.",
-        },
-        {
-          term: "التحول القتالي (Metamorphosis)",
-          explanation: "مرحلة نادرة في الموريم يُعاد فيها صقل عظام وعضلات المقاتل بفضل طاقة التشي المتطرفة.",
-        },
-        {
-          term: "السماوات العليا (Upper Heavens)",
-          explanation: "أعلى مستوى من استبصار نصل السيف في عالم الفنون القتالية القديم.",
-        },
-      ],
-    };
-  });
-
-  return {
-    id: `cheon-clan-${chStr}`,
-    title: "Becoming the Cheon Clan's Mad Dog",
-    titleArabic: "كلب عشيرة تشيون المسعور",
-    chapterNumber: chStr,
-    chapterTitle: `Chapter ${chStr}: Metamorphosis & The Upper Heavens`,
-    chapterTitleArabic: `الفصل ${chStr}: التحول القتالي واستبصار السماوات`,
-    sourceUrl: `https://manhuaus.com/manga/becoming-the-cheon-clans-mad-dog/chapter-${chStr}/`,
-    coverImage: `/api/proxy-image?url=${encodeURIComponent(`${baseUrl}/0001.webp`)}`,
-    pages,
-  };
+// In-memory Translation Cache (SHA-256 hash -> translation data)
+interface CachedTranslation {
+  timestamp: number;
+  data: any;
 }
+const translationCache = new Map<string, CachedTranslation>();
 
-const REAL_CHAPTERS = [
-  generateCheonClanChapter(24),
-  generateCheonClanChapter(23),
-  generateCheonClanChapter(22),
-];
+// Rate limiters
+const proxyRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  message: 'تم تجاوز الحد الأقصى لجلب الصور مؤقتاً، يرجى الانتظار دقيقة واحدة.',
+});
 
-// Helper: Promise with timeout to ensure Gemini calls never hang
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+const scrapeRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 25,
+  message: 'تم تجاوز الحد المسموح به لجلب الفصول، يرجى الانتظار دقيقة واحدة.',
+});
+
+const translateRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  maxRequests: 35,
+  message: 'تم تجاوز الحد المسموح به لطلبات الترجمة مؤقتاً، يرجى الانتظار دقيقة واحدة.',
+});
+
+// Helper: Promise with timeout
+function withTimeout<T>(promise: Promise<T>, ms: number, errorMessage = 'انتهت مهلة الطلب'): Promise<T> {
   return Promise.race([
     promise,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error('انتهت مهلة استجابة الذكاء الاصطناعي')), ms)
-    ),
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(errorMessage)), ms)),
   ]);
 }
 
-// 1. Image Proxy endpoint
-app.get('/api/proxy-image', async (req, res) => {
+// 1. Image Proxy endpoint with robust SSRF protection and size bounds
+app.get('/api/proxy-image', proxyRateLimiter, async (req, res) => {
   const imageUrl = req.query.url as string;
   if (!imageUrl) {
-    return res.status(400).send('URL required');
+    return res.status(400).send('Image URL parameter is required');
+  }
+
+  // SSRF Protection Check
+  const urlCheck = await isSafeUrl(imageUrl);
+  if (!urlCheck.safe) {
+    return res.status(403).send(`Forbidden: ${urlCheck.reason || 'Invalid or prohibited destination URL'}`);
   }
 
   try {
     const parsed = new URL(imageUrl);
-    const origin = parsed.origin;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
 
     const response = await fetch(imageUrl, {
+      signal: controller.signal,
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': origin + '/',
+        'Referer': parsed.origin + '/',
         'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
       },
     });
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
-      return res.status(response.status).send(`Failed to fetch image: ${response.status}`);
+      return res.status(response.status).send(`Failed to fetch image: status ${response.status}`);
     }
 
-    const contentType = response.headers.get('content-type') || 'image/webp';
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+    // Verify Content-Type is actually an image
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.toLowerCase().startsWith('image/')) {
+      return res
+        .status(415)
+        .send('Unsupported Media Type: The requested resource is not an image');
+    }
+
+    // Verify response length under 15MB
+    const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
+    if (contentLength > 15 * 1024 * 1024) {
+      return res.status(413).send('Payload Too Large: Image exceeds 15MB limit');
+    }
 
     const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.byteLength > 15 * 1024 * 1024) {
+      return res.status(413).send('Payload Too Large: Image exceeds 15MB limit');
+    }
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
     return res.send(buffer);
   } catch (err: any) {
+    if (err.name === 'AbortError') {
+      return res.status(504).send('Gateway Timeout: The target server took too long to respond');
+    }
     return res.status(500).send(err.message || 'Error proxying image');
   }
 });
 
-// 2. Fetch chapter endpoint
-app.post('/api/manga/fetch-chapter', async (req, res) => {
+// 2. Fetch chapter endpoint with SSRF protection, honest error reporting, and no secret fallbacks
+app.post('/api/manga/fetch-chapter', scrapeRateLimiter, async (req, res) => {
   const { url } = req.body;
   if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'يرجى إدخال رابط الفصل' });
+    return res.status(400).json({ success: false, error: 'يرجى إدخال رابط الفصل' });
   }
 
-  const lowerUrl = url.toLowerCase().trim();
-
-  // Handle "Becoming the Cheon Clan's Mad Dog"
-  const isCheonClan =
-    lowerUrl.includes('cheon-clan') ||
-    lowerUrl.includes('cheon') ||
-    lowerUrl.includes('mad-dog') ||
-    lowerUrl.includes('scoundrel');
-
-  if (isCheonClan) {
-    const match = lowerUrl.match(/chapter[_-]?(\d+)/);
-    const chapterNum = match ? parseInt(match[1], 10) : 24;
-
-    const found = REAL_CHAPTERS.find((c) => c.chapterNumber === chapterNum.toString());
-    const chapterToServe = found || generateCheonClanChapter(chapterNum);
-
-    return res.json({
-      success: true,
-      chapter: chapterToServe,
-      note: `تم جلب الفصل ${chapterNum} كاملاً مع الترجمات العربية المدمجة.`,
+  // SSRF Protection Check
+  const urlCheck = await isSafeUrl(url);
+  if (!urlCheck.safe) {
+    return res.status(403).json({
+      success: false,
+      error: urlCheck.reason || 'الرابط المدخل غير مسموح به لأسباب أمنية',
     });
   }
 
-  // Generic Scraper
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 12000);
+
     const scrapeRes = await fetch(url, {
+      signal: controller.signal,
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -546,15 +164,22 @@ app.post('/api/manga/fetch-chapter', async (req, res) => {
         'Referer': new URL(url).origin,
       },
     });
+    clearTimeout(timeoutId);
 
     const html = await scrapeRes.text();
 
-    if (html.includes('Just a moment...') || html.includes('cf_chl') || html.includes('cloudflare')) {
-      return res.json({
-        success: true,
-        chapter: REAL_CHAPTERS[0],
-        warning:
-          'الموقع الأصلي محمي ضد السحب الآلي (Cloudflare). تم تحميل صفحات الفصل 24 الأصلية فورياً لتجربة القراءة والترجمة.',
+    // Detect Cloudflare WAF or Turnstile challenge
+    if (
+      html.includes('Just a moment...') ||
+      html.includes('cf_chl') ||
+      html.includes('cloudflare') ||
+      html.includes('Cloudflare Ray ID')
+    ) {
+      return res.status(403).json({
+        success: false,
+        isCloudflareBlocked: true,
+        error:
+          'الموقع المستهدف محمي بنظام Cloudflare Turnstile ضد السحب البرمجي. يُرجى استخدام ميزة "رفع صفحات المانجا" (Upload) لترجمة أي صورة بدقة عالية وبدون حظر، أو تجربة أحد الفصول النموذجية الجاهزة.',
       });
     }
 
@@ -596,95 +221,77 @@ app.post('/api/manga/fetch-chapter', async (req, res) => {
       if (imageUrls.length >= 3) break;
     }
 
-    if (imageUrls.length > 0) {
-      const genericChapter = {
-        id: 'scraped-' + Date.now(),
-        title,
-        titleArabic: title,
-        chapterNumber: '1',
-        chapterTitle,
-        chapterTitleArabic: chapterTitle,
-        sourceUrl: url,
-        coverImage: `/api/proxy-image?url=${encodeURIComponent(imageUrls[0])}`,
-        pages: imageUrls.map((img, idx) => ({
-          pageNumber: idx + 1,
-          imageUrl: `/api/proxy-image?url=${encodeURIComponent(img)}`,
-          originalUrl: img,
-          caption: `الصفحة ${idx + 1}`,
-          precomputedTranslations: [
-            {
-              id: `scraped-p${idx + 1}-1`,
-              box_2d: [300, 200, 440, 800],
-              originalText: `Manga dialogue on page ${idx + 1}`,
-              arabicTranslation: `حوارات وأحداث المشهد في الصفحة ${idx + 1}.`,
-              speaker: 'الشخصية',
-              type: 'speech',
-              tone: 'determined',
-            },
-          ],
-          termsExplained: [],
-        })),
-      };
-
-      return res.json({
-        success: true,
-        chapter: genericChapter,
+    if (imageUrls.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error:
+          'لم يتم العثور على صور صفحات في هذا الرابط. قد يحتاج الموقع إلى تسجيل دخول أو استخدام جافاسكريبت معقدة. جرّب رفع الصور مباشرة عبر ميزة الرفع.',
       });
     }
 
+    const scrapedChapter = {
+      id: 'scraped-' + Date.now(),
+      title,
+      titleArabic: title,
+      chapterNumber: '1',
+      chapterTitle,
+      chapterTitleArabic: chapterTitle,
+      sourceUrl: url,
+      coverImage: `/api/proxy-image?url=${encodeURIComponent(imageUrls[0])}`,
+      pages: imageUrls.map((img, idx) => ({
+        pageNumber: idx + 1,
+        imageUrl: `/api/proxy-image?url=${encodeURIComponent(img)}`,
+        originalUrl: img,
+        caption: `الصفحة ${idx + 1}`,
+        precomputedTranslations: [],
+        termsExplained: [],
+      })),
+    };
+
     return res.json({
       success: true,
-      chapter: REAL_CHAPTERS[0],
-      warning: 'تم تحميل الفصل 24 الحقيقي مباشرة.',
+      chapter: scrapedChapter,
     });
   } catch (err: any) {
-    return res.json({
-      success: true,
-      chapter: REAL_CHAPTERS[0],
-      warning: `تعذر الاتصال بالموقع (${err.message}). تم فتح الفصل 24 الحقيقي.`,
+    if (err.name === 'AbortError') {
+      return res.status(504).json({
+        success: false,
+        error: 'انتهت مهلة الاتصال بالموقع (تجاوزت 12 ثانية).',
+      });
+    }
+    return res.status(502).json({
+      success: false,
+      error: `تعذر الاتصال بالموقع المطلوب: ${err.message || 'خطأ في الشبكة'}`,
     });
   }
 });
 
-// 3. Get Real Chapters List
+// 3. Get verified Sample Chapters
 app.get('/api/manga/samples', (req, res) => {
-  res.json({
-    chapters: REAL_CHAPTERS,
+  return res.json({
+    success: true,
+    chapters: SAMPLE_CHAPTERS,
   });
 });
 
-// 4. Translate Manga Page using Gemini Vision with 6-second timeout and instant fallback
-app.post('/api/manga/translate-page', async (req, res) => {
+// 4. Translate Manga Page using Gemini Vision with honest errors, SHA-256 caching, and structured schema
+app.post('/api/manga/translate-page', translateRateLimiter, async (req, res) => {
   const { imageSource, pageNumber } = req.body;
   const pageNum = parseInt(pageNumber, 10) || 1;
 
-  // Find fallback precomputed translation
-  const fallbackDialogues = CHAPTER_24_FULL_PAGES[pageNum] || [
-    {
-      id: `p${pageNum}-fallback`,
-      box_2d: [300, 200, 440, 800],
-      originalText: 'Murim dialogue scene',
-      arabicTranslation: `ترجمة حوارات ومواجهة الصفحة ${pageNum} من الفصل.`,
-      speaker: 'تشيون مويانغ',
-      type: 'speech',
-      tone: 'determined',
-    },
-  ];
+  if (!imageSource || typeof imageSource !== 'string') {
+    return res.status(400).json({
+      success: false,
+      error: 'مصدر صورة الصفحة مطلوب لإجراء الترجمة',
+    });
+  }
 
+  // Check if Gemini API key is configured
   if (!ai) {
-    return res.json({
-      success: true,
-      translation: {
-        pageSummary: `مجريات وأحداث الصفحة ${pageNum} من الفصل.`,
-        readingDirection: 'top-down',
-        dialogues: fallbackDialogues,
-        termsExplained: [
-          {
-            term: "تشيون مويانغ",
-            explanation: "بطل القصة الملقب بـ كلب عشيرة تشيون المسعور.",
-          },
-        ],
-      },
+    return res.status(401).json({
+      success: false,
+      error:
+        'مفتاح Gemini API غير متوفر في متغيرات البيئة. يرجى تفعيل أو ربط مفتاحك من قائمة Settings > Secrets في لوحة التحكم لتشغيل الترجمة الآلية.',
     });
   }
 
@@ -699,67 +306,238 @@ app.post('/api/manga/translate-page', async (req, res) => {
       base64Data = parts[1];
     } else if (imageSource.startsWith('/api/proxy-image?url=')) {
       const realUrl = decodeURIComponent(imageSource.replace('/api/proxy-image?url=', ''));
+
+      // Validate URL before downloading
+      const urlCheck = await isSafeUrl(realUrl);
+      if (!urlCheck.safe) {
+        return res.status(403).json({
+          success: false,
+          error: `رابط الصورة غير مسموح به لأسباب أمنية: ${urlCheck.reason}`,
+        });
+      }
+
       const imgRes = await fetch(realUrl, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Referer': new URL(realUrl).origin + '/',
         },
       });
+
+      if (!imgRes.ok) {
+        return res.status(502).json({
+          success: false,
+          error: `تعذر تنزيل صورة الصفحة من المصدر (رمز الاستجابة: ${imgRes.status})`,
+        });
+      }
+
+      const buffer = Buffer.from(await imgRes.arrayBuffer());
+      if (buffer.byteLength > 15 * 1024 * 1024) {
+        return res.status(413).json({
+          success: false,
+          error: 'حجم صورة الصفحة يتجاوز الحد المسموح به (15 ميغابايت)',
+        });
+      }
+
+      base64Data = buffer.toString('base64');
+      mimeType = imgRes.headers.get('content-type') || 'image/webp';
+    } else if (imageSource.startsWith('http://') || imageSource.startsWith('https://')) {
+      const urlCheck = await isSafeUrl(imageSource);
+      if (!urlCheck.safe) {
+        return res.status(403).json({
+          success: false,
+          error: `رابط الصورة غير مسموح به لأسباب أمنية: ${urlCheck.reason}`,
+        });
+      }
+
+      const imgRes = await fetch(imageSource, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': new URL(imageSource).origin + '/',
+        },
+      });
+
+      if (!imgRes.ok) {
+        return res.status(502).json({
+          success: false,
+          error: `تعذر جلب صورة الصفحة (رمز الاستجابة: ${imgRes.status})`,
+        });
+      }
+
       const buffer = Buffer.from(await imgRes.arrayBuffer());
       base64Data = buffer.toString('base64');
       mimeType = imgRes.headers.get('content-type') || 'image/webp';
     }
 
     if (!base64Data) {
-      return res.json({
-        success: true,
-        translation: {
-          pageSummary: `حوارات الصفحة ${pageNum}.`,
-          dialogues: fallbackDialogues,
-        },
+      return res.status(400).json({
+        success: false,
+        error: 'لم نتمكن من استخراج بيانات الصورة للتحليل',
       });
     }
 
-    // Call Gemini with 6-second timeout
+    // Compute SHA-256 hash for translation cache lookup
+    const imageHash = crypto.createHash('sha256').update(base64Data).digest('hex');
+    const cached = translationCache.get(imageHash);
+
+    // Cache valid for 48 hours
+    if (cached && Date.now() - cached.timestamp < 48 * 60 * 60 * 1000) {
+      return res.json({
+        success: true,
+        translation: cached.data,
+        cached: true,
+      });
+    }
+
+    // Call Gemini with generous 25-second timeout and structured schema
+    const promptText = `You are a professional comic and webtoon typesetter and translator.
+Task:
+1. Examine this comic page image. Detect all speech bubbles, dialogue boxes, thought bubbles, and sound effect texts.
+2. For each dialogue, detect its 2D bounding box [ymin, xmin, ymax, xmax] normalized on a scale from 0 to 1000:
+   - ymin: top percentage * 10
+   - xmin: left percentage * 10
+   - ymax: bottom percentage * 10
+   - xmax: right percentage * 10
+3. Extract the original text in the speech bubble.
+4. Translate it accurately and naturally into Modern Standard Arabic suited for manga/manhwa. Preserve emotional tone and character personality.
+5. Provide a short pageSummary in Arabic, and explain any martial arts, fantasy, or historical terminology in termsExplained.`;
+
     const geminiCall = ai.models.generateContent({
       model: 'gemini-3.8-flash',
       contents: {
         parts: [
           { inlineData: { mimeType, data: base64Data } },
-          {
-            text: `Extract all speech bubbles from this comic page and translate to natural Arabic. Return JSON with dialogues: [{id, box_2d: [ymin,xmin,ymax,xmax], originalText, arabicTranslation, speaker, type, tone}] and pageSummary.`,
-          },
+          { text: promptText },
         ],
       },
       config: {
         responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            pageSummary: {
+              type: Type.STRING,
+              description: 'ملخص موجز لمجريات وأحداث هذه الصفحة باللغة العربية',
+            },
+            readingDirection: {
+              type: Type.STRING,
+              description: 'top-down or right-to-left',
+            },
+            dialogues: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  box_2d: {
+                    type: Type.ARRAY,
+                    items: { type: Type.INTEGER },
+                    description: '[ymin, xmin, ymax, xmax] between 0 and 1000',
+                  },
+                  originalText: { type: Type.STRING },
+                  arabicTranslation: { type: Type.STRING },
+                  speaker: { type: Type.STRING },
+                  type: {
+                    type: Type.STRING,
+                    description: 'speech, thought, shout, narration, or sfx',
+                  },
+                  tone: {
+                    type: Type.STRING,
+                    description: 'angry, calm, shocked, whisper, or determined',
+                  },
+                },
+                required: ['box_2d', 'originalText', 'arabicTranslation'],
+              },
+            },
+            termsExplained: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  term: { type: Type.STRING },
+                  explanation: { type: Type.STRING },
+                },
+                required: ['term', 'explanation'],
+              },
+            },
+          },
+          required: ['dialogues'],
+        },
       },
     });
 
-    const response = await withTimeout(geminiCall, 6000);
-    const text = response.text || '{}';
-    const parsed = JSON.parse(text);
+    const response = await withTimeout(
+      geminiCall,
+      25000,
+      'استغرقت المعالجة بالذكاء الاصطناعي وقتاً أطول من المتوقع (25 ثانية). يرجى الضغط على زر إعادة المحاولة.'
+    );
 
-    if (parsed.dialogues && parsed.dialogues.length > 0) {
-      return res.json({ success: true, translation: parsed });
+    const text = response.text || '{}';
+    let parsed: any;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return res.status(502).json({
+        success: false,
+        error: 'لم نتمكن من تحليل استجابة الذكاء الاصطناعي بصيغة JSON صحيحة. يرجى إعادة المحاولة.',
+      });
     }
 
+    // Validate dialogues array
+    if (!parsed.dialogues || !Array.isArray(parsed.dialogues)) {
+      parsed.dialogues = [];
+    }
+
+    // Ensure IDs and valid box_2d coordinates
+    parsed.dialogues = parsed.dialogues.map((dlg: any, idx: number) => {
+      const box = Array.isArray(dlg.box_2d) && dlg.box_2d.length === 4 ? dlg.box_2d : [300, 200, 440, 800];
+      return {
+        id: dlg.id || `p${pageNum}-d${idx + 1}-${Date.now()}`,
+        box_2d: [
+          Math.max(0, Math.min(1000, Number(box[0]) || 0)),
+          Math.max(0, Math.min(1000, Number(box[1]) || 0)),
+          Math.max(0, Math.min(1000, Number(box[2]) || 100)),
+          Math.max(0, Math.min(1000, Number(box[3]) || 100)),
+        ],
+        originalText: dlg.originalText || '',
+        arabicTranslation: dlg.arabicTranslation || '',
+        speaker: dlg.speaker || 'حوار',
+        type: dlg.type || 'speech',
+        tone: dlg.tone || 'calm',
+      };
+    });
+
+    // Save into cache
+    translationCache.set(imageHash, {
+      timestamp: Date.now(),
+      data: parsed,
+    });
+
     return res.json({
       success: true,
-      translation: {
-        pageSummary: parsed.pageSummary || `حوارات الصفحة ${pageNum}.`,
-        dialogues: fallbackDialogues,
-      },
+      translation: parsed,
+      cached: false,
     });
   } catch (err: any) {
-    console.warn(`Translation fallback used for page ${pageNum}:`, err.message);
-    // Instant zero-failure fallback
-    return res.json({
-      success: true,
-      translation: {
-        pageSummary: `أحداث الصفحة ${pageNum} من الفصل.`,
-        dialogues: fallbackDialogues,
-      },
+    console.error(`Gemini translation error for page ${pageNum}:`, err);
+
+    let clientMessage = err.message || 'حدث خطأ غير متوقع أثناء معالجة الصفحة';
+    let statusCode = 502;
+
+    if (clientMessage.includes('PERMISSION_DENIED') || clientMessage.includes('API_KEY_INVALID')) {
+      clientMessage =
+        'مفتاح Gemini API غير صالح أو غير مصرح له. يرجى التأكد من المفتاح في إعدادات التطبيق Settings > Secrets.';
+      statusCode = 403;
+    } else if (clientMessage.includes('RESOURCE_EXHAUSTED')) {
+      clientMessage =
+        'تم استنفاد الحصة المخصصة لنموذج Gemini حالياً. يرجى الانتظار دقيقة ثم إعادة المحاولة، أو الترقية لمفتاح مدفوع.';
+      statusCode = 429;
+    } else if (clientMessage.includes('مهلة')) {
+      statusCode = 504;
+    }
+
+    return res.status(statusCode).json({
+      success: false,
+      error: clientMessage,
     });
   }
 });
